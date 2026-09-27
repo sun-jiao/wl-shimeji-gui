@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=wl_shimeji GUI
+Comment=Qt frontend for wl_shimeji
+Exec=python3 %h/.local/share/wl-shimeji-gui/wl_shimeji_gui.py
+Icon=applications-games
+Terminal=false
+Categories=Utility;Game;
+StartupNotify=true
