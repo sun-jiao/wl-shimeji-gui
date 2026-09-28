@@ -48,6 +48,7 @@ def run_ctl_sync(*args, input_str=None, timeout=12):
     when called without an attached TTY.
     """
     master, slave = pty.openpty()
+    os.set_blocking(master, False)
     try:
         p = subprocess.Popen(
             ['shimejictl', *args],
@@ -65,7 +66,7 @@ def run_ctl_sync(*args, input_str=None, timeout=12):
 
         chunks = []
         while True:
-            r, _, _ = select.select([master], [], [], 0.15)
+            r, _, _ = select.select([master], [], [], 0.1)
             if r:
                 try:
                     d = os.read(master, 4096)
@@ -73,12 +74,18 @@ def run_ctl_sync(*args, input_str=None, timeout=12):
                         break
                     chunks.append(d)
                 except OSError as e:
-                    if e.errno in (errno.EIO, errno.EBADF):
+                    if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        pass
+                    elif e.errno in (errno.EIO, errno.EBADF):
                         break
-                    raise
-            elif p.poll() is not None:
-                # Process ended, drain remaining bytes
+                    else:
+                        raise
+            if p.poll() is not None:
+                # Process ended, drain remaining bytes with non-blocking reads
                 while True:
+                    r2, _, _ = select.select([master], [], [], 0.02)
+                    if not r2:
+                        break
                     try:
                         d = os.read(master, 4096)
                         if not d:
@@ -126,6 +133,7 @@ class CtlAsyncWorker(QThread):
 
     def run(self):
         master, slave = pty.openpty()
+        os.set_blocking(master, False)
         self._master = master
         chunks = []
         try:
@@ -155,12 +163,18 @@ class CtlAsyncWorker(QThread):
                         chunks.append(d)
                         self.output_received.emit(text)
                     except OSError as e:
-                        if e.errno in (errno.EIO, errno.EBADF):
+                        if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                            pass
+                        elif e.errno in (errno.EIO, errno.EBADF):
                             break
-                        raise
-                elif p.poll() is not None:
-                    # Drain remaining bytes
+                        else:
+                            raise
+                if p.poll() is not None:
+                    # Drain remaining bytes using non-blocking select
                     while True:
+                        r2, _, _ = select.select([master], [], [], 0.02)
+                        if not r2:
+                            break
                         try:
                             d = os.read(master, 4096)
                             if not d:
@@ -309,12 +323,51 @@ def parse_section(text, heading):
     return list(dict.fromkeys(values))
 
 
+def filter_behaviors(name, raw_behaviors):
+    """
+    Filter out compiler-generated condition markers (e.g. ___CONDITION_0, ___CONDITION_1),
+    internal wall transitions (e.g. LeaveWall), and hidden/conditioner behaviors.
+    """
+    b_json_paths = [
+        DATA / 'shimejis' / f'Shimeji.{name}' / 'behaviors.json',
+        DATA / 'shimejis' / name / 'behaviors.json',
+        DATA / 'prototypes' / f'Shimeji.{name}' / 'behaviors.json',
+        DATA / 'prototypes' / name / 'behaviors.json',
+    ]
+    defs_map = {}
+    for p in b_json_paths:
+        if p.exists():
+            try:
+                import json
+                with open(p, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                for item in data.get('definitions', []):
+                    defs_map[item.get('name')] = item
+                break
+            except Exception:
+                pass
+
+    filtered = []
+    for b in raw_behaviors:
+        if not b:
+            continue
+        # Filter compiler artifacts and internal wall-transition handlers
+        if b.startswith('_') or 'condition' in b.lower() or b.lower() == 'leavewall':
+            continue
+        b_def = defs_map.get(b)
+        if b_def and (b_def.get('hidden') or b_def.get('is_conditioner')):
+            continue
+        filtered.append(b)
+    return filtered
+
+
 def proto_info(name):
-    """Retrieve behaviors and raw output for a prototype."""
+    """Retrieve clean behaviors, actions, and raw output for a prototype."""
     rc, out = run_ctl_sync('prototypes', 'info', name)
     behaviors = parse_section(out, 'Behaviors') if rc == 0 else []
     actions = parse_section(out, 'Actions') if rc == 0 else []
-    return behaviors, actions, out
+    clean_behaviors = filter_behaviors(name, behaviors)
+    return clean_behaviors, actions, out
 
 
 def prototype_store_path(info):
@@ -1005,7 +1058,13 @@ class MainWindow(QMainWindow):
 
         def on_done(rc, out):
             self.btn_cancel_worker.setEnabled(False)
-            self.status_label.setText(f'命令执行完成 (返回码: {rc})')
+            self.current_worker = None
+            if rc == 0:
+                self.status_label.setText('命令执行完成 (返回码: 0)')
+                if not out.strip():
+                    self.log("[命令执行完毕]\n")
+            else:
+                self.status_label.setText(f'命令执行异常 (返回码: {rc})')
             if callback:
                 callback(rc, out)
             self.refresh_environments()
@@ -1016,6 +1075,8 @@ class MainWindow(QMainWindow):
     def cancel_current_command(self):
         if self.current_worker:
             self.current_worker.cancel()
+            self.current_worker = None
+            self.btn_cancel_worker.setEnabled(False)
             self.status_label.setText('已请求中断当前命令')
 
     def current_prototype_name(self):
